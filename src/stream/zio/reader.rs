@@ -17,6 +17,9 @@ pub struct Reader<R, D> {
 
     single_frame: bool,
     finished_frame: bool,
+    // A flush was requested but the operation still has output to deliver.
+    // While set, `read` keeps draining the flush before pulling more input.
+    flush_pending: bool,
 }
 
 enum State {
@@ -39,6 +42,7 @@ impl<R, D> Reader<R, D> {
             state: State::Reading,
             single_frame: false,
             finished_frame: false,
+            flush_pending: false,
         }
     }
 
@@ -70,11 +74,43 @@ impl<R, D> Reader<R, D> {
     /// Flush any internal buffer.
     ///
     /// For encoders, this ensures all input consumed so far is compressed.
+    ///
+    /// Returns the number of bytes written to `output`; keep calling until
+    /// it returns `Ok(0)` to collect everything. This never pulls more data
+    /// from the underlying reader.
     pub fn flush(&mut self, output: &mut [u8]) -> io::Result<usize>
     where
         D: Operation,
     {
-        self.operation.flush(&mut OutBuffer::around(output))
+        // No room to deliver anything: report `Ok(0)` without touching the
+        // operation, so no pending output is dropped and no state changes.
+        if output.is_empty() {
+            return Ok(0);
+        }
+
+        match self.state {
+            State::Reading => {
+                self.flush_pending = true;
+                let mut dst = OutBuffer::around(output);
+                let remaining = self.operation.flush(&mut dst)?;
+                if remaining == 0 {
+                    self.flush_pending = false;
+                }
+                Ok(dst.pos())
+            }
+            State::PastEof => {
+                // The input is exhausted: deliver the rest of the frame
+                // (e.g. the epilogue) instead of just the buffered output.
+                let mut dst = OutBuffer::around(output);
+                let remaining =
+                    self.operation.finish(&mut dst, self.finished_frame)?;
+                if remaining == 0 {
+                    self.state = State::Finished;
+                }
+                Ok(dst.pos())
+            }
+            State::Finished => Ok(0),
+        }
     }
 }
 
@@ -232,6 +268,25 @@ where
         loop {
             match self.state {
                 State::Reading => {
+                    // A flush was started but not fully delivered: keep
+                    // draining it before accepting any more input, so the
+                    // flushed bytes come out ahead of anything new.
+                    if self.flush_pending {
+                        let mut dst = OutBuffer::around(buf);
+                        let remaining = self.operation.flush(&mut dst)?;
+                        if remaining == 0 {
+                            self.flush_pending = false;
+                        }
+                        if dst.pos() > 0 {
+                            return Ok(dst.pos());
+                        }
+                        if self.flush_pending {
+                            // Nothing came out but the flush is not done:
+                            // try again rather than reporting a false EOF.
+                            continue;
+                        }
+                    }
+
                     let (bytes_read, bytes_written) = {
                         // Start with a fresh pool of un-processed data.
                         // This is the only line that can return an interruption error.

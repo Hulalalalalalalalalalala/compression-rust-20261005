@@ -1,5 +1,5 @@
 use crate::stream::read::{Decoder, Encoder};
-use std::io::Read;
+use std::io::{self, Read};
 
 #[test]
 fn test_error_handling() {
@@ -77,4 +77,213 @@ fn test_read_to_end_leaves_no_padding_on_error() {
         input.starts_with(&output[6..]),
         "padding leaked into the output"
     );
+}
+
+#[test]
+fn test_flush_reports_bytes_written() {
+    let input: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+    let mut encoder = Encoder::new(&input[..], 1).unwrap();
+
+    // Pull some compressed data out first so there is pending input.
+    let mut compressed = Vec::new();
+    let mut buf = [0u8; 64];
+    let n = encoder.read(&mut buf).unwrap();
+    compressed.extend_from_slice(&buf[..n]);
+
+    // Flush with a 1-byte buffer: every return value must fit the buffer
+    // and describe exactly the bytes delivered this call.
+    let mut one = [0u8; 1];
+    loop {
+        let n = encoder.flush(&mut one).unwrap();
+        assert!(n <= one.len());
+        if n == 0 {
+            break;
+        }
+        compressed.extend_from_slice(&one[..n]);
+    }
+
+    // The rest of the stream still comes out through `read`.
+    encoder.read_to_end(&mut compressed).unwrap();
+
+    let decoded = crate::decode_all(&compressed[..]).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_flush_empty_buffer_is_noop() {
+    let input = b"some test data, some test data, some test data";
+    let mut encoder = Encoder::new(&input[..], 1).unwrap();
+
+    let mut buf = [0u8; 32];
+    let n = encoder.read(&mut buf).unwrap();
+    let mut compressed = buf[..n].to_vec();
+
+    // No room: reports 0, but must not drop pending output or consume input.
+    assert_eq!(encoder.flush(&mut []).unwrap(), 0);
+    assert_eq!(encoder.flush(&mut []).unwrap(), 0);
+
+    // A non-empty buffer still delivers everything that was pending.
+    let mut one = [0u8; 1];
+    loop {
+        let n = encoder.flush(&mut one).unwrap();
+        if n == 0 {
+            break;
+        }
+        compressed.extend_from_slice(&one[..n]);
+    }
+    encoder.read_to_end(&mut compressed).unwrap();
+
+    let decoded = crate::decode_all(&compressed[..]).unwrap();
+    assert_eq!(decoded, &input[..]);
+}
+
+#[test]
+fn test_read_resumes_interrupted_flush() {
+    let input: Vec<u8> = (0..20_000).map(|i| (i % 253) as u8).collect();
+    let mut encoder = Encoder::new(&input[..], 3).unwrap();
+
+    let mut compressed = Vec::new();
+    let mut buf = [0u8; 100];
+    let n = encoder.read(&mut buf).unwrap();
+    compressed.extend_from_slice(&buf[..n]);
+
+    // Start a flush with a tiny buffer, then switch back to `read` before
+    // the flush is done: `read` must deliver the rest of the flushed bytes
+    // (ahead of any new input) rather than a premature 0.
+    let mut one = [0u8; 1];
+    let n = encoder.flush(&mut one).unwrap();
+    compressed.extend_from_slice(&one[..n]);
+
+    let mut small = [0u8; 7];
+    loop {
+        let n = encoder.read(&mut small).unwrap();
+        if n == 0 {
+            break;
+        }
+        compressed.extend_from_slice(&small[..n]);
+        loop {
+            let m = encoder.flush(&mut one).unwrap();
+            if m == 0 {
+                break;
+            }
+            compressed.extend_from_slice(&one[..m]);
+        }
+    }
+
+    let decoded = crate::decode_all(&compressed[..]).unwrap();
+    assert_eq!(decoded, input);
+}
+
+/// A source that hands out short chunks, returning `WouldBlock` in between.
+struct WouldBlockChunks {
+    data: Vec<u8>,
+    pos: usize,
+    chunk: usize,
+    block_next: bool,
+}
+
+impl Read for WouldBlockChunks {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.data.len() {
+            return Ok(0);
+        }
+        if self.block_next {
+            self.block_next = false;
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "not yet"));
+        }
+        self.block_next = true;
+        let n = self.chunk.min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn test_flush_after_would_block() {
+    let input: Vec<u8> = (0..3000).map(|i| (i % 241) as u8).collect();
+    let source = WouldBlockChunks {
+        data: input.clone(),
+        pos: 0,
+        chunk: 5,
+        block_next: false,
+    };
+    let mut encoder = Encoder::new(source, 1).unwrap();
+
+    let mut compressed = Vec::new();
+    let mut buf = [0u8; 16];
+    let mut flushed = false;
+    loop {
+        match encoder.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => compressed.extend_from_slice(&buf[..n]),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // The read failed, but the input accepted so far must still
+                // come out through `flush`.
+                let mut three = [0u8; 3];
+                loop {
+                    let n = encoder.flush(&mut three).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    flushed = true;
+                    compressed.extend_from_slice(&three[..n]);
+                }
+            }
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+    assert!(flushed);
+
+    let decoded = crate::decode_all(&compressed[..]).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_flush_delivers_frame_tail_after_eof() {
+    let input: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+    let mut encoder = Encoder::new(&input[..], 1).unwrap();
+
+    // Read and flush with 1-byte buffers, so the frame tail past EOF ends
+    // up delivered through `flush`, one byte at a time.
+    let mut compressed = Vec::new();
+    let mut one = [0u8; 1];
+    loop {
+        let mut progressed = false;
+        let n = encoder.read(&mut one).unwrap();
+        if n > 0 {
+            compressed.extend_from_slice(&one[..n]);
+            progressed = true;
+        }
+        loop {
+            let m = encoder.flush(&mut one).unwrap();
+            if m == 0 {
+                break;
+            }
+            compressed.extend_from_slice(&one[..m]);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    // Once the tail is delivered, both entries report a stable 0.
+    assert_eq!(encoder.read(&mut one).unwrap(), 0);
+    assert_eq!(encoder.flush(&mut one).unwrap(), 0);
+    assert_eq!(encoder.read(&mut one).unwrap(), 0);
+
+    let decoded = crate::decode_all(&compressed[..]).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_empty_input_produces_empty_frame() {
+    let mut encoder = Encoder::new(&[][..], 1).unwrap();
+    let mut compressed = Vec::new();
+    encoder.read_to_end(&mut compressed).unwrap();
+    assert!(!compressed.is_empty());
+
+    let decoded = crate::decode_all(&compressed[..]).unwrap();
+    assert!(decoded.is_empty());
 }

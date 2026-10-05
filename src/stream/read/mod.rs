@@ -254,8 +254,14 @@ impl<'a, R: BufRead> Encoder<'a, R> {
     /// Since it prevents bundling currently buffered data with future input,
     /// it may affect compression ratio.
     ///
-    /// * Returns the number of bytes written to `out`.
-    /// * Returns `Ok(0)` when everything has been flushed.
+    /// * Returns the number of bytes written to `out`; `out[..n]` holds the
+    ///   newly flushed data and the rest of `out` is left untouched.
+    /// * Returns `Ok(0)` when everything has been flushed. With a small
+    ///   `out`, keep calling and concatenating until that happens.
+    /// * An empty `out` always yields `Ok(0)` without changing anything.
+    ///
+    /// This never pulls more data from the underlying reader, and can be
+    /// freely interleaved with `read`.
     pub fn flush(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.reader.flush(out)
     }
