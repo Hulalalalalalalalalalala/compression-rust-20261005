@@ -1,0 +1,10 @@
+
+[build]
+jobs = 2
+[env]
+CC = "/usr/bin/gcc"
+CXX = "/usr/bin/g++"
+[profile.dev]
+debug = 0
+[profile.test]
+debug = 0
