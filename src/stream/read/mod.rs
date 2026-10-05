@@ -254,8 +254,16 @@ impl<'a, R: BufRead> Encoder<'a, R> {
     /// Since it prevents bundling currently buffered data with future input,
     /// it may affect compression ratio.
     ///
-    /// * Returns the number of bytes written to `out`.
-    /// * Returns `Ok(0)` when everything has been flushed.
+    /// * Returns the number of bytes written to `out`: `out[..n]` holds the
+    ///   new compressed data. If the pending output does not fit, keep
+    ///   calling and concatenate the returned slices.
+    /// * Returns `Ok(0)` for a non-empty buffer when everything consumed so
+    ///   far has been flushed. An empty buffer always yields `Ok(0)` without
+    ///   changing anything.
+    ///
+    /// This never pulls more input from the underlying reader, and does not
+    /// end the frame being read; once the reader has reached EOF, it keeps
+    /// delivering the frame's remaining tail instead.
     pub fn flush(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.reader.flush(out)
     }

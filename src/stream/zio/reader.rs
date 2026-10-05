@@ -67,14 +67,57 @@ impl<R, D> Reader<R, D> {
         self.reader
     }
 
-    /// Flush any internal buffer.
+    /// Flush any internal buffer into `output`.
     ///
     /// For encoders, this ensures all input consumed so far is compressed.
+    ///
+    /// Returns the number of bytes written to `output`: `output[..n]`
+    /// holds the new output, and `Ok(0)` means everything consumed so far
+    /// has been flushed. If the pending output does not fit, keep calling
+    /// until it returns `Ok(0)` and concatenate the returned slices.
+    ///
+    /// This never pulls more input from the underlying reader, and does
+    /// not end the frame being read. Once the reader has reached EOF,
+    /// though, this keeps delivering the frame's remaining tail instead.
+    ///
+    /// An empty `output` always returns `Ok(0)` without changing
+    /// anything: no input is consumed, no pending output is dropped, and
+    /// the end-of-stream state is left untouched.
     pub fn flush(&mut self, output: &mut [u8]) -> io::Result<usize>
     where
         D: Operation,
     {
-        self.operation.flush(&mut OutBuffer::around(output))
+        // With no room to write, nothing can be delivered - and nothing
+        // may change either. In particular the operation is not given a
+        // chance to consume input or drop pending output it cannot place.
+        if output.is_empty() {
+            return Ok(0);
+        }
+
+        match self.state {
+            State::Reading => {
+                // Only deliver what the operation has already buffered:
+                // do not pull more input from the reader, and do not end
+                // the frame. The operation reports how much is still
+                // pending; what matters here is how much was written.
+                let mut dst = OutBuffer::around(output);
+                self.operation.flush(&mut dst)?;
+                Ok(dst.pos())
+            }
+            State::PastEof => {
+                // The reader is at EOF: the rest of the frame comes from
+                // finishing the operation, however many calls it takes.
+                let mut dst = OutBuffer::around(output);
+                let hint =
+                    self.operation.finish(&mut dst, self.finished_frame)?;
+                if hint == 0 {
+                    // The frame tail is complete; nothing more will come.
+                    self.state = State::Finished;
+                }
+                Ok(dst.pos())
+            }
+            State::Finished => Ok(0),
+        }
     }
 }
 
