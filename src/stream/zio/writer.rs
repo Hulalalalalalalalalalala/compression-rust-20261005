@@ -27,8 +27,15 @@ pub struct Writer<W, D> {
     /// Where the operation writes, before it gets flushed to the writer
     buffer: Vec<u8>,
 
-    // When `true`, indicates that nothing should be added to the buffer.
-    // All that's left if to empty the buffer.
+    // When `true`, indicates that `finish()` has been requested.
+    //
+    // Nothing should be added to the buffer anymore: all that's left is to
+    // finish the stream and empty the buffer. A `flush()` in this state
+    // completes the ongoing close instead of starting a regular flush.
+    finishing: bool,
+
+    // When `true`, indicates that the operation is done producing data.
+    // All that's left is to empty the buffer.
     finished: bool,
 
     /// When `true`, the operation just finished a frame.
@@ -84,6 +91,7 @@ where
             // 32KB buffer? That's what flate2 uses
             buffer: output_buffer,
 
+            finishing: false,
             finished: false,
             finished_frame: false,
         }
@@ -99,6 +107,9 @@ where
     ///
     /// Keep calling it until it returns `Ok(())`, then don't call it again.
     pub fn finish(&mut self) -> io::Result<()> {
+        // From this point on, no more input can be accepted, and `flush()`
+        // will complete this close instead of starting a regular flush.
+        self.finishing = true;
         loop {
             // Keep trying until we're really done.
             self.write_from_offset()?;
@@ -217,7 +228,7 @@ where
     D: Operation,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.finished {
+        if self.finishing {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "encoder is finished",
@@ -264,21 +275,25 @@ where
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut finished = self.finished;
-        loop {
-            // If the output is blocked or has an error, return now.
-            self.write_from_offset()?;
+        if self.finishing {
+            // A close was already requested: keep completing it instead of
+            // starting a regular flush (which would not finish the frame,
+            // and could corrupt the stream).
+            self.finish()?;
+        } else {
+            loop {
+                // If the output is blocked or has an error, return now.
+                self.write_from_offset()?;
 
-            if finished {
-                break;
+                let hint = self.with_buffer(|dst, op| op.flush(dst));
+
+                self.offset = 0;
+                let hint = hint?;
+
+                if hint == 0 {
+                    break;
+                }
             }
-
-            let hint = self.with_buffer(|dst, op| op.flush(dst));
-
-            self.offset = 0;
-            let hint = hint?;
-
-            finished = hint == 0;
         }
 
         self.writer.flush()
