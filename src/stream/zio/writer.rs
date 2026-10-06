@@ -31,6 +31,13 @@ pub struct Writer<W, D> {
     // All that's left if to empty the buffer.
     finished: bool,
 
+    // When `true`, a finish has been requested (but may have been
+    // interrupted, e.g. by a `WouldBlock` error from the writer).
+    //
+    // From that point on, `flush()` must keep driving the finish to
+    // completion instead of starting a regular flush.
+    finish_requested: bool,
+
     /// When `true`, the operation just finished a frame.
     ///
     /// Only happens when decompressing.
@@ -85,6 +92,7 @@ where
             buffer: output_buffer,
 
             finished: false,
+            finish_requested: false,
             finished_frame: false,
         }
     }
@@ -99,6 +107,7 @@ where
     ///
     /// Keep calling it until it returns `Ok(())`, then don't call it again.
     pub fn finish(&mut self) -> io::Result<()> {
+        self.finish_requested = true;
         loop {
             // Keep trying until we're really done.
             self.write_from_offset()?;
@@ -110,29 +119,36 @@ where
             }
 
             // Let's fill this buffer again!
-
-            let finished_frame = self.finished_frame;
-            let hint =
-                self.with_buffer(|dst, op| op.finish(dst, finished_frame));
-            self.offset = 0;
-            // println!("Hint: {:?}\nOut:{:?}", hint, &self.buffer);
-
-            // We return here if zstd had a problem.
-            // Could happen with invalid data, ...
-            let hint = hint?;
-
-            if hint != 0 && self.buffer.is_empty() {
-                // This happens if we are decoding an incomplete frame.
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "incomplete frame",
-                ));
-            }
-
-            // println!("Finishing {}, {}", bytes_written, hint);
-
-            self.finished = hint == 0;
+            self.finish_step()?;
         }
+    }
+
+    /// Runs a single step of the finish operation.
+    ///
+    /// Generates the next batch of frame trailer into `self.buffer`,
+    /// and updates `self.finished` accordingly.
+    fn finish_step(&mut self) -> io::Result<()> {
+        let finished_frame = self.finished_frame;
+        let hint = self.with_buffer(|dst, op| op.finish(dst, finished_frame));
+        self.offset = 0;
+        // println!("Hint: {:?}\nOut:{:?}", hint, &self.buffer);
+
+        // We return here if zstd had a problem.
+        // Could happen with invalid data, ...
+        let hint = hint?;
+
+        if hint != 0 && self.buffer.is_empty() {
+            // This happens if we are decoding an incomplete frame.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete frame",
+            ));
+        }
+
+        // println!("Finishing {}, {}", bytes_written, hint);
+
+        self.finished = hint == 0;
+        Ok(())
     }
 
     /// Run the given closure on `self.buffer`.
@@ -264,21 +280,31 @@ where
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut finished = self.finished;
+        let mut flushed = self.finished;
         loop {
             // If the output is blocked or has an error, return now.
             self.write_from_offset()?;
 
-            if finished {
+            if flushed {
                 break;
             }
 
-            let hint = self.with_buffer(|dst, op| op.flush(dst));
+            if self.finish_requested {
+                // A finish was requested but did not complete (the writer
+                // blocked halfway through the frame trailer, for instance).
+                // Keep closing the frame instead of starting a regular
+                // flush: the operation must not be taken back to a state
+                // where new data could be compressed.
+                self.finish_step()?;
+                flushed = self.finished;
+            } else {
+                let hint = self.with_buffer(|dst, op| op.flush(dst));
 
-            self.offset = 0;
-            let hint = hint?;
+                self.offset = 0;
+                let hint = hint?;
 
-            finished = hint == 0;
+                flushed = hint == 0;
+            }
         }
 
         self.writer.flush()
