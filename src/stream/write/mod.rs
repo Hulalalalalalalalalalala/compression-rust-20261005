@@ -31,9 +31,17 @@ pub struct Encoder<'a, W: Write> {
 
 /// A decoder that decompress and forward data to another writer.
 ///
+/// When all the compressed data has been written, call [`finish()`] (or
+/// [`try_finish()`]/[`do_finish()`]) to confirm that the compressed input
+/// ended on a complete frame and that all the decompressed data has been
+/// flushed to the underlying writer.
+///
 /// Note that you probably want to `flush()` after writing your stream content.
 /// You can use [`auto_flush()`] to automatically flush the writer on drop.
 ///
+/// [`finish()`]: #method.finish
+/// [`try_finish()`]: #method.try_finish
+/// [`do_finish()`]: #method.do_finish
 /// [`auto_flush()`]: Decoder::auto_flush
 pub struct Decoder<'a, W: Write> {
     // output writer (decompressed data)
@@ -408,8 +416,51 @@ impl<'a, W: Write> Decoder<'a, W> {
     }
 
     /// Returns the inner `Write`.
+    ///
+    /// This does *not* check that the compressed input ended on a complete
+    /// frame; use [`finish()`](#method.finish) for that.
     pub fn into_inner(self) -> W {
         self.writer.into_inner().0
+    }
+
+    /// Finishes the stream, and returns the underlying writer.
+    ///
+    /// This verifies that the compressed input ended on a complete frame
+    /// (reporting `UnexpectedEof` if the last frame is truncated), pushes
+    /// any remaining decompressed data to the underlying writer, and
+    /// flushes it.
+    ///
+    /// To get back `self` in case an error happened, use `try_finish`.
+    pub fn finish(self) -> io::Result<W> {
+        self.try_finish().map_err(|(_, err)| err)
+    }
+
+    /// Attempts to finish the stream.
+    ///
+    /// This returns the inner writer if the finish was successful, or the
+    /// object plus an error if it wasn't.
+    ///
+    /// `write` on this object will refuse any new (non-empty) input after
+    /// `try_finish` has been called, even if it fails.
+    pub fn try_finish(mut self) -> Result<W, (Self, io::Error)> {
+        match self.do_finish() {
+            Ok(()) => Ok(self.writer.into_inner().0),
+            Err(e) => Err((self, e)),
+        }
+    }
+
+    /// Attempts to finish the stream.
+    ///
+    /// The finish is only successful once the compressed input ended on a
+    /// complete frame, all the decompressed data has been handed over to
+    /// the underlying writer, and flushing it succeeded.
+    ///
+    /// If this fails (e.g. because the underlying writer is temporarily
+    /// blocked), it can be called again to resume where it left off;
+    /// `flush()` also drives an interrupted finish to completion.
+    pub fn do_finish(&mut self) -> io::Result<()> {
+        self.writer.finish()?;
+        self.writer.writer_mut().flush()
     }
 
     /// Return a recommendation for the size of data to write at once.

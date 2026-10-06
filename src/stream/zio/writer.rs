@@ -35,8 +35,17 @@ pub struct Writer<W, D> {
     // interrupted, e.g. by a `WouldBlock` error from the writer).
     //
     // From that point on, `flush()` must keep driving the finish to
-    // completion instead of starting a regular flush.
+    // completion instead of starting a regular flush, and no new
+    // (non-empty) input is accepted.
     finish_requested: bool,
+
+    // The first error reported by the operation itself (corrupt input,
+    // bad checksum, ...), if any.
+    //
+    // Such errors are not recoverable: once one has been seen, no more
+    // output may be produced, and subsequent calls must report the
+    // failure again instead of going back to the operation.
+    op_error: Option<io::Error>,
 
     /// When `true`, the operation just finished a frame.
     ///
@@ -93,6 +102,7 @@ where
 
             finished: false,
             finish_requested: false,
+            op_error: None,
             finished_frame: false,
         }
     }
@@ -108,6 +118,10 @@ where
     /// Keep calling it until it returns `Ok(())`, then don't call it again.
     pub fn finish(&mut self) -> io::Result<()> {
         self.finish_requested = true;
+        if let Some(error) = self.operation_error() {
+            // The operation already failed: do not produce any more output.
+            return Err(error);
+        }
         loop {
             // Keep trying until we're really done.
             self.write_from_offset()?;
@@ -123,6 +137,25 @@ where
         }
     }
 
+    /// Returns the error the operation failed with, if any.
+    ///
+    /// `io::Error` is not `Clone`, so a fresh error with the same kind and
+    /// message is built on each call.
+    fn operation_error(&self) -> Option<io::Error> {
+        self.op_error
+            .as_ref()
+            .map(|e| io::Error::new(e.kind(), e.to_string()))
+    }
+
+    /// Remembers an error reported by the operation, and returns it.
+    ///
+    /// The first caller gets the original error; a copy is latched so that
+    /// later calls keep failing instead of producing more output.
+    fn latch_error(&mut self, error: io::Error) -> io::Error {
+        self.op_error = Some(io::Error::new(error.kind(), error.to_string()));
+        error
+    }
+
     /// Runs a single step of the finish operation.
     ///
     /// Generates the next batch of frame trailer into `self.buffer`,
@@ -135,7 +168,7 @@ where
 
         // We return here if zstd had a problem.
         // Could happen with invalid data, ...
-        let hint = hint?;
+        let hint = hint.map_err(|e| self.latch_error(e))?;
 
         if hint != 0 && self.buffer.is_empty() {
             // This happens if we are decoding an incomplete frame.
@@ -233,11 +266,21 @@ where
     D: Operation,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.finished {
+        if self.finished || self.finish_requested {
+            // A finish was requested (even one that failed, e.g. on a
+            // `WouldBlock`): no new input is accepted from that point on.
+            // An empty slice carries no input, so it is simply a no-op.
+            if buf.is_empty() {
+                return Ok(0);
+            }
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "encoder is finished",
             ));
+        }
+        if let Some(error) = self.operation_error() {
+            // The operation already failed: do not produce any more output.
+            return Err(error);
         }
         // Keep trying until _something_ has been consumed.
         // As soon as some input has been taken, we cannot afford
@@ -249,8 +292,9 @@ where
             // At this point `self.buffer` can safely be discarded.
 
             // Support writing concatenated frames by re-initializing the
-            // context.
-            if self.finished_frame {
+            // context. An empty write carries no input: it does not start
+            // a new frame, so a just-completed frame is left untouched.
+            if self.finished_frame && !buf.is_empty() {
                 self.operation.reinit()?;
                 self.finished_frame = false;
             }
@@ -265,7 +309,7 @@ where
             // );
 
             self.offset = 0;
-            let hint = hint?;
+            let hint = hint.map_err(|e| self.latch_error(e))?;
 
             if hint == 0 {
                 self.finished_frame = true;
@@ -280,6 +324,10 @@ where
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if let Some(error) = self.operation_error() {
+            // The operation already failed: do not produce any more output.
+            return Err(error);
+        }
         let mut flushed = self.finished;
         loop {
             // If the output is blocked or has an error, return now.
@@ -301,7 +349,7 @@ where
                 let hint = self.with_buffer(|dst, op| op.flush(dst));
 
                 self.offset = 0;
-                let hint = hint?;
+                let hint = hint.map_err(|e| self.latch_error(e))?;
 
                 flushed = hint == 0;
             }
