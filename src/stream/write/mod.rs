@@ -34,7 +34,14 @@ pub struct Encoder<'a, W: Write> {
 /// Note that you probably want to `flush()` after writing your stream content.
 /// You can use [`auto_flush()`] to automatically flush the writer on drop.
 ///
+/// To additionally check that the compressed input ended on a frame
+/// boundary (and was not truncated), use [`finish()`], [`try_finish()`] or
+/// [`do_finish()`] instead of just flushing.
+///
 /// [`auto_flush()`]: Decoder::auto_flush
+/// [`finish()`]: Decoder::finish
+/// [`try_finish()`]: Decoder::try_finish
+/// [`do_finish()`]: Decoder::do_finish
 pub struct Decoder<'a, W: Write> {
     // output writer (decompressed data)
     writer: zio::Writer<W, raw::Decoder<'a>>,
@@ -410,6 +417,63 @@ impl<'a, W: Write> Decoder<'a, W> {
     /// Returns the inner `Write`.
     pub fn into_inner(self) -> W {
         self.writer.into_inner().0
+    }
+
+    /// Finishes the stream, confirming that the compressed input ended
+    /// exactly on a frame boundary.
+    ///
+    /// This only succeeds once the compressed input forms a whole number
+    /// of frames (concatenated frames are fine), all the decompressed
+    /// data has been forwarded to the underlying writer, and the
+    /// underlying writer has been flushed successfully.
+    ///
+    /// If the compressed input is empty or ends in the middle of a frame
+    /// (partial header, partial data or partial checksum), an
+    /// [`io::ErrorKind::UnexpectedEof`] error is returned.
+    ///
+    /// This returns the inner writer in case you need it.
+    ///
+    /// To get back `self` in case an error happened, use `try_finish`.
+    pub fn finish(self) -> io::Result<W> {
+        self.try_finish().map_err(|(_, err)| err)
+    }
+
+    /// Attempts to finish the stream, confirming that the compressed
+    /// input ended exactly on a frame boundary.
+    ///
+    /// This returns the inner writer if the finish was successful, or the
+    /// object plus an error if it wasn't, so the finish can be retried
+    /// (see [`do_finish`](#method.do_finish)).
+    ///
+    /// No more compressed input is accepted after the first call to this
+    /// method, even if it fails: `write` will return an error.
+    pub fn try_finish(mut self) -> Result<W, (Self, io::Error)> {
+        match self.do_finish() {
+            // Return the writer, because why not
+            Ok(()) => Ok(self.writer.into_inner().0),
+            Err(e) => Err((self, e)),
+        }
+    }
+
+    /// Attempts to finish the stream, confirming that the compressed
+    /// input ended exactly on a frame boundary.
+    ///
+    /// This only succeeds once the compressed input forms a whole number
+    /// of frames, all the decompressed data has been forwarded to the
+    /// underlying writer, and the underlying writer has been flushed
+    /// successfully.
+    ///
+    /// If the underlying writer reports an error (for instance
+    /// [`io::ErrorKind::WouldBlock`]), the error is forwarded as-is,
+    /// keeping any decompressed data that could not be delivered yet;
+    /// the finish can then be retried by calling this method again (or
+    /// `flush()`) once the writer is able to accept more data.
+    ///
+    /// No more compressed input is accepted after the first call to this
+    /// method, even if it fails: `write` will return an error.
+    pub fn do_finish(&mut self) -> io::Result<()> {
+        self.writer.finish()?;
+        self.writer.writer_mut().flush()
     }
 
     /// Return a recommendation for the size of data to write at once.

@@ -233,10 +233,13 @@ where
     D: Operation,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.finished {
+        if self.finished || (self.finish_requested && !buf.is_empty()) {
+            // Once a finish has been requested - even one that was
+            // interrupted, e.g. by a `WouldBlock` error - no more input
+            // is accepted.
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "encoder is finished",
+                "stream is finished",
             ));
         }
         // Keep trying until _something_ has been consumed.
@@ -250,7 +253,10 @@ where
 
             // Support writing concatenated frames by re-initializing the
             // context.
-            if self.finished_frame {
+            //
+            // An empty write does not start a new frame: it must not
+            // invalidate a frame that was just completed.
+            if self.finished_frame && !buf.is_empty() {
                 self.operation.reinit()?;
                 self.finished_frame = false;
             }
